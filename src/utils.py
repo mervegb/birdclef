@@ -1,7 +1,7 @@
 import os
 import shutil
 
-input_dir = "data/processed/spectrograms"
+input_dir = "data/processed/spectrograms_gray"
 output_dir = "data/processed/spectrograms_sorted"
 
 os.makedirs(output_dir, exist_ok=True)

@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from models.bird_cnn import BirdCNN  # ✅ Make sure this path is correct!
+from models.bird_cnn import BirdCNN  
 
 # ========== CONFIG ========== #
 DATA_DIR = "data/processed/spectrograms_sorted"
@@ -44,17 +44,19 @@ model = BirdCNN(num_classes=num_classes)
 
 # ========== CALLBACKS ========== #
 checkpoint_callback = ModelCheckpoint(
-    monitor="val_loss",
-    filename="birdnet-{epoch:02d}-{val_loss:.2f}",
-    save_top_k=1,
-    save_last=True,
-    mode="min"
+    monitor="val_macro_auc",
+    filename="birdnet-epoch{epoch:02d}-auc{val_macro_auc:.4f}",
+    save_top_k=-1,            # Save all checkpoints
+    every_n_epochs=1,         # Save every epoch
+    save_last=True,           # (Optional) Save latest separately as last.ckpt
+    mode="max"                # Because higher AUC is better
 )
 
+
 early_stopping_callback = EarlyStopping(
-    monitor="val_loss",
+    monitor="val_macro_auc",
     patience=5,
-    mode="min",
+    mode="max",
     verbose=True
 )
 
