@@ -7,9 +7,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from models.bird_cnn import BirdCNN  
 
 # ========== CONFIG ========== #
-DATA_DIR = "data/processed/spectrograms_sorted"
+DATA_DIR = "data/processed/spectrograms"
 BATCH_SIZE = 32
-IMG_SIZE = 224
+IMG_SIZE = (128, 512)
 EPOCHS = 100
 LR = 1e-4
 NUM_WORKERS = 0  # 👈 safer for Mac & debugging; increase if you're on Linux
@@ -18,7 +18,7 @@ MODEL_FULL_PATH = "birdnet_model_full.pt"
 
 # ========== TRANSFORMS ========== #
 transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Resize(IMG_SIZE),  
     transforms.ToTensor()
 ])
 
@@ -70,13 +70,13 @@ trainer = Trainer(
 )
 
 # ========== TRAIN ========== #
-trainer.fit(model, train_loader, val_loader)
+# trainer.fit(model, train_loader, val_loader)
 
-# ========== SAVE FINAL MODEL ========== #
-# Save model weights (recommended for deployment/fine-tuning)
-torch.save(model.state_dict(), MODEL_WEIGHTS_PATH)
-print(f"✅ Model weights saved to: {MODEL_WEIGHTS_PATH}")
+# # ========== SAVE FINAL MODEL ========== #
+# # Save model weights (recommended for deployment/fine-tuning)
+# torch.save(model.state_dict(), MODEL_WEIGHTS_PATH)
+# print(f"✅ Model weights saved to: {MODEL_WEIGHTS_PATH}")
 
-# Optionally save full model (not portable across different environments)
-torch.save(model, MODEL_FULL_PATH)
-print(f"✅ Full model saved to: {MODEL_FULL_PATH}")
+# # Optionally save full model (not portable across different environments)
+# torch.save(model, MODEL_FULL_PATH)
+# print(f"✅ Full model saved to: {MODEL_FULL_PATH}")
