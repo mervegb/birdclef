@@ -1,28 +1,80 @@
+import os
 import torch
-from torch.utils.data import DataLoader
-from torchvision import transforms
+from torch.utils.data import DataLoader, random_split
+from torchvision import datasets, transforms
 from pytorch_lightning import Trainer
-from dataset.bird_dataset import BirdSpectrogramDataset
-from models.bird_cnn import BirdCNN
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from models.bird_cnn import BirdCNN  # ✅ Make sure this path is correct!
 
-# 🔧 Configs
-DATA_PATH = "data/processed/spectrograms"
+# ========== CONFIG ========== #
+DATA_DIR = "data/processed/spectrograms_sorted"
 BATCH_SIZE = 32
-NUM_CLASSES = 100  # Update this after checking the actual number
+IMG_SIZE = 224
+EPOCHS = 100
+LR = 1e-4
+NUM_WORKERS = 0  # 👈 safer for Mac & debugging; increase if you're on Linux
+MODEL_WEIGHTS_PATH = "birdnet_weights.pt"
+MODEL_FULL_PATH = "birdnet_model_full.pt"
 
-# Transforms
+# ========== TRANSFORMS ========== #
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor()
 ])
 
-# Dataset and Dataloader
-dataset = BirdSpectrogramDataset(DATA_PATH, transform=transform)
-train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+# ========== DATASET ========== #
+dataset = datasets.ImageFolder(root=DATA_DIR, transform=transform)
 
-# Model
-model = BirdCNN(num_classes=len(dataset.label_to_index))
+# ✅ Avoid empty val set
+val_size = max(1, int(0.2 * len(dataset)))
+train_size = len(dataset) - val_size
 
-# Trainer
-trainer = Trainer(max_epochs=10, accelerator="auto")
-trainer.fit(model, train_loader)
+train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
+print(f"📊 Dataset split: Train={len(train_ds)} | Val={len(val_ds)}")
+print(f"📚 Classes found: {dataset.classes}")
+
+# ========== DATALOADERS ========== #
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+
+# ========== MODEL ========== #
+num_classes = len(dataset.classes)
+model = BirdCNN(num_classes=num_classes)
+
+# ========== CALLBACKS ========== #
+checkpoint_callback = ModelCheckpoint(
+    monitor="val_loss",
+    filename="birdnet-{epoch:02d}-{val_loss:.2f}",
+    save_top_k=1,
+    save_last=True,
+    mode="min"
+)
+
+early_stopping_callback = EarlyStopping(
+    monitor="val_loss",
+    patience=5,
+    mode="min",
+    verbose=True
+)
+
+# ========== TRAINER ========== #
+trainer = Trainer(
+    max_epochs=EPOCHS,
+    accelerator="auto",  # GPU if available
+    callbacks=[checkpoint_callback, early_stopping_callback],
+    log_every_n_steps=10,
+    num_sanity_val_steps=0
+)
+
+# ========== TRAIN ========== #
+trainer.fit(model, train_loader, val_loader)
+
+# ========== SAVE FINAL MODEL ========== #
+# Save model weights (recommended for deployment/fine-tuning)
+torch.save(model.state_dict(), MODEL_WEIGHTS_PATH)
+print(f"✅ Model weights saved to: {MODEL_WEIGHTS_PATH}")
+
+# Optionally save full model (not portable across different environments)
+torch.save(model, MODEL_FULL_PATH)
+print(f"✅ Full model saved to: {MODEL_FULL_PATH}")

@@ -21,7 +21,22 @@ class BirdCNN(pl.LightningModule):
         x, y = batch
         logits = self(x)
         loss = F.cross_entropy(logits, y)
-        self.log("train_loss", loss)
+        acc = (logits.argmax(dim=1) == y).float().mean()
+
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = F.cross_entropy(logits, y)
+        acc = (logits.argmax(dim=1) == y).float().mean()
+
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_acc", acc, on_epoch=True, prog_bar=True, logger=True)
+
         return loss
 
     def configure_optimizers(self):

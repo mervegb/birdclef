@@ -10,3 +10,4 @@ transformers
 tqdm
 jupyter
 pydub
+pytorch_lightning
