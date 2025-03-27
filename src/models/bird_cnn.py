@@ -37,7 +37,9 @@ class BirdCNN(pl.LightningModule):
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
-        probs = F.softmax(logits, dim=1).detach().cpu()
+        # probs = F.softmax(logits, dim=1).detach().cpu()
+        # ⚠️ Use sigmoid for per-class multi-label AUC
+        probs = torch.sigmoid(logits).detach().cpu()
         y_true = y.detach().cpu()
 
         self.validation_step_outputs.append((probs, y_true))
