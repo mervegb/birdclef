@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from models.bird_cnn import BirdCNN  
 
 # ========== CONFIG ========== #
-DATA_DIR = "data/processed/spectrograms"
+DATA_DIR = "data/processed/spectrograms_filtered"
 BATCH_SIZE = 32
 IMG_SIZE = (128, 512)
 EPOCHS = 100

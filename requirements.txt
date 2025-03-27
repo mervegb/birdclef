@@ -11,3 +11,4 @@ tqdm
 jupyter
 pydub
 pytorch_lightning
+opencv-python
