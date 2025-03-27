@@ -12,16 +12,23 @@ OUTPUT_DIR = "data/processed/spectrograms"
 TARGET_HEIGHT = 128
 TARGET_WIDTH = 512
 CHUNK_DURATION = 5.0
-ENERGY_THRESHOLD_DB = 10
+ENERGY_THRESHOLD_DB = 20
 MAX_CHUNKS_PER_FILE = 3
 SR = 32000
 
 # ========== HELPERS ========== #
+
+# This will center the actual signal in the image instead of pushing it to the left and filling the rest with black.
 def pad_spectrogram(S, target_width):
-    if S.shape[1] >= target_width:
+    current_width = S.shape[1]
+    if current_width >= target_width:
         return S[:, :target_width]
-    pad_width = target_width - S.shape[1]
-    return np.pad(S, ((0, 0), (0, pad_width)), mode='constant')
+    
+    pad_total = target_width - current_width
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+
+    return np.pad(S, ((0, 0), (pad_left, pad_right)), mode='constant')
 
 def is_high_energy(y, sr, threshold_db):
     rms = librosa.feature.rms(y=y)[0]
@@ -34,7 +41,7 @@ def process_row(index_row):
     try:
         subfolder, audio_file = row['filename'].split('/')
         audio_path = os.path.join(AUDIO_BASE_DIR, subfolder, audio_file)
-        print(f"🎧 Processing {index}: {audio_path}")
+        print(f"🎧 Previewing {audio_path}")
 
         if not os.path.exists(audio_path):
             print(f"❌ File not found: {audio_path}")
@@ -63,9 +70,11 @@ def process_row(index_row):
             img = (S_padded * 255).astype(np.uint8)
             img = np.flip(img, axis=0)
 
-            # 🔧 Fix shape: ensure proper 2D image
+            # 🔧 Ensure it's 2D grayscale image
             if img.ndim == 3 and img.shape[-1] == 1:
                 img = img[:, :, 0]
+            if img.ndim == 3 and img.shape[-1] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
             class_name = row['common_name'].replace(" ", "_").lower()
             class_dir = os.path.join(OUTPUT_DIR, class_name)
@@ -78,7 +87,7 @@ def process_row(index_row):
             chunk_id += 1
 
     except Exception as e:
-        print(f"❌ [{index}] Failed for {row['filename']}: {e}")
+        print(f"❌ [{index}] Failed for {row.get('filename', 'unknown')}: {e}")
 
 # ========== MAIN PARALLEL RUN ========== #
 if __name__ == "__main__":

@@ -1,24 +1,39 @@
 import pytorch_lightning as pl
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
+from torchvision import models
 from sklearn.metrics import roc_auc_score
 
 class BirdCNN(pl.LightningModule):
     def __init__(self, num_classes):
         super().__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        self.num_classes = num_classes
+
+        # Load EfficientNet-B0 backbone
+        backbone = models.efficientnet_b0(weights="IMAGENET1K_V1")
+        self.feature_extractor = backbone.features
+
+        # Freeze if desired
+        # for param in self.feature_extractor.parameters():
+        #     param.requires_grad = False
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(32 * 32 * 128, 128), nn.ReLU(),
+            nn.Linear(backbone.classifier[1].in_features, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(128, num_classes)
         )
-        self.num_classes = num_classes
+
         self.validation_step_outputs = []
 
     def forward(self, x):
-        return self.model(x)
+        x = self.feature_extractor(x)
+        x = self.classifier(x)
+        return x
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -37,11 +52,8 @@ class BirdCNN(pl.LightningModule):
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
-        # probs = F.softmax(logits, dim=1).detach().cpu()
-        # ⚠️ Use sigmoid for per-class multi-label AUC
-        probs = torch.sigmoid(logits).detach().cpu()
+        probs = F.softmax(logits, dim=1).detach().cpu()
         y_true = y.detach().cpu()
-
         self.validation_step_outputs.append((probs, y_true))
         return loss
 
@@ -52,7 +64,6 @@ class BirdCNN(pl.LightningModule):
 
         # One-hot encode true labels
         y_true_oh = F.one_hot(torch.tensor(all_targets), num_classes=self.num_classes).numpy()
-
         aucs = []
         for i in range(self.num_classes):
             if y_true_oh[:, i].sum() == 0:

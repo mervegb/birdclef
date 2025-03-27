@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from models.bird_cnn import BirdCNN  
 
 # ========== CONFIG ========== #
-DATA_DIR = "data/processed/spectrograms_filtered"
+DATA_DIR = "data/processed/spectrograms"
 BATCH_SIZE = 32
 IMG_SIZE = (128, 512)
 EPOCHS = 100
@@ -18,7 +18,7 @@ MODEL_FULL_PATH = "birdnet_model_full.pt"
 
 # ========== TRANSFORMS ========== #
 transform = transforms.Compose([
-    transforms.Resize(IMG_SIZE),  
+    transforms.Resize((224, 224)),  # Resize to EfficientNet input size
     transforms.ToTensor()
 ])
 
