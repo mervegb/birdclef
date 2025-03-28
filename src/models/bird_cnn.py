@@ -2,7 +2,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models
+from torchvision.models import efficientnet_b2, EfficientNet_B2_Weights
 from sklearn.metrics import roc_auc_score
 
 class BirdCNN(pl.LightningModule):
@@ -10,15 +10,10 @@ class BirdCNN(pl.LightningModule):
         super().__init__()
         self.num_classes = num_classes
 
-        # Load EfficientNet-B0 backbone
-        backbone = models.efficientnet_b0(weights="IMAGENET1K_V1")
+        weights = EfficientNet_B2_Weights.IMAGENET1K_V1
+        backbone = efficientnet_b2(weights=weights)
         self.feature_extractor = backbone.features
 
-        # Freeze if desired
-        # for param in self.feature_extractor.parameters():
-        #     param.requires_grad = False
-
-        # Classification head
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),

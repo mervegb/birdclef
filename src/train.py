@@ -12,13 +12,13 @@ BATCH_SIZE = 32
 IMG_SIZE = (128, 512)
 EPOCHS = 100
 LR = 1e-4
-NUM_WORKERS = 0  # 👈 safer for Mac & debugging; increase if you're on Linux
+NUM_WORKERS = os.cpu_count()
 MODEL_WEIGHTS_PATH = "birdnet_weights.pt"
 MODEL_FULL_PATH = "birdnet_model_full.pt"
 
 # ========== TRANSFORMS ========== #
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),  # Resize to EfficientNet input size
+    transforms.Resize((260, 260)), #EfficientNet-B2 expects 260×260 input
     transforms.ToTensor()
 ])
 
@@ -62,6 +62,7 @@ early_stopping_callback = EarlyStopping(
 
 # ========== TRAINER ========== #
 trainer = Trainer(
+    precision=16,  # Mixed precision
     max_epochs=EPOCHS,
     accelerator="auto",  # GPU if available
     callbacks=[checkpoint_callback, early_stopping_callback],
