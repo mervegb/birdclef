@@ -18,7 +18,7 @@ MODEL_FULL_PATH = "birdnet_model_full.pt"
 
 # ========== TRANSFORMS ========== #
 transform = transforms.Compose([
-    transforms.Resize((260, 260)), #EfficientNet-B2 expects 260×260 input
+    transforms.Resize((224, 224)),
     transforms.ToTensor()
 ])
 

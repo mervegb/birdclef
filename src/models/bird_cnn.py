@@ -2,7 +2,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import efficientnet_b2, EfficientNet_B2_Weights
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from sklearn.metrics import roc_auc_score
 
 class BirdCNN(pl.LightningModule):
@@ -10,8 +10,8 @@ class BirdCNN(pl.LightningModule):
         super().__init__()
         self.num_classes = num_classes
 
-        weights = EfficientNet_B2_Weights.IMAGENET1K_V1
-        backbone = efficientnet_b2(weights=weights)
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1
+        backbone = efficientnet_b0(weights=weights)
         self.feature_extractor = backbone.features
 
         self.classifier = nn.Sequential(
@@ -37,6 +37,7 @@ class BirdCNN(pl.LightningModule):
         acc = (logits.argmax(dim=1) == y).float().mean()
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -57,12 +58,11 @@ class BirdCNN(pl.LightningModule):
         all_targets = torch.cat([x[1] for x in self.validation_step_outputs], dim=0).numpy()
         self.validation_step_outputs.clear()
 
-        # One-hot encode true labels
         y_true_oh = F.one_hot(torch.tensor(all_targets), num_classes=self.num_classes).numpy()
         aucs = []
         for i in range(self.num_classes):
             if y_true_oh[:, i].sum() == 0:
-                continue  # skip class with no positive samples
+                continue
             auc = roc_auc_score(y_true_oh[:, i], all_probs[:, i])
             aucs.append(auc)
 
@@ -71,4 +71,9 @@ class BirdCNN(pl.LightningModule):
         print(f"📈 val_macro_auc = {macro_auc:.4f}")
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)  # back to default
+        scheduler = {
+            "scheduler": torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5),
+            "interval": "epoch"
+        }
+        return [optimizer], [scheduler]
