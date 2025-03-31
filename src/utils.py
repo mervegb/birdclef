@@ -1,15 +1,16 @@
-import os
-import shutil
+import numpy as np
+import torch
 
-input_dir = "data/processed/spectrograms_gray"
-output_dir = "data/processed/spectrograms_sorted"
+def mixup_data(x, y, alpha=0.4):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
 
-os.makedirs(output_dir, exist_ok=True)
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
 
-for file in os.listdir(input_dir):
-    if file.endswith(".png"):
-        _, species = file.split("_", 1)
-        species = species.replace(".png", "")
-        species_dir = os.path.join(output_dir, species)
-        os.makedirs(species_dir, exist_ok=True)
-        shutil.copy(os.path.join(input_dir, file), os.path.join(species_dir, file.split("_")[0] + ".png"))
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam

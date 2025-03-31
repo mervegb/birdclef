@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from sklearn.metrics import roc_auc_score
+from utils import mixup_data
 
 class BirdCNN(pl.LightningModule):
     def __init__(self, num_classes):
@@ -32,9 +33,11 @@ class BirdCNN(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
+        x, y_a, y_b, lam = mixup_data(x, y, alpha=0.4)
         logits = self(x)
-        loss = F.cross_entropy(logits, y)
+        loss = lam * F.cross_entropy(logits, y_a) + (1 - lam) * F.cross_entropy(logits, y_b)
         acc = (logits.argmax(dim=1) == y).float().mean()
+
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
         self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], prog_bar=True)

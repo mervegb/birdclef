@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from models.bird_cnn import BirdCNN  
+from bird_cnn import BirdCNN  
 
 # ========== CONFIG ========== #
 DATA_DIR = "data/processed/spectrograms"
