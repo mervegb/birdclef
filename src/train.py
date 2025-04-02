@@ -8,10 +8,10 @@ from bird_cnn import BirdCNN
 
 # ========== CONFIG ========== #
 DATA_DIR = "data/processed/spectrograms"
-BATCH_SIZE = 32
+BATCH_SIZE = 96
 IMG_SIZE = (128, 512)
 EPOCHS = 100
-LR = 1e-4
+LR = 1e-3
 NUM_WORKERS = os.cpu_count()
 MODEL_WEIGHTS_PATH = "birdnet_weights.pt"
 MODEL_FULL_PATH = "birdnet_model_full.pt"

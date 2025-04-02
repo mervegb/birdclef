@@ -74,7 +74,7 @@ class BirdCNN(pl.LightningModule):
         print(f"📈 val_macro_auc = {macro_auc:.4f}")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)  # back to default
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)  # back to default
         scheduler = {
             "scheduler": torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5),
             "interval": "epoch"
