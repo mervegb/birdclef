@@ -4,9 +4,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from sklearn.metrics import roc_auc_score
-from utils import mixup_data
 
-class BirdCNN(pl.LightningModule):
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+class BirdFocalCNN(pl.LightningModule):
     def __init__(self, num_classes):
         super().__init__()
         self.num_classes = num_classes
@@ -22,6 +39,7 @@ class BirdCNN(pl.LightningModule):
             nn.Dropout(0.3),
             nn.Linear(128, num_classes)
         )
+        self.focal_loss = FocalLoss(gamma=2.0)
         self.validation_step_outputs = []
 
     def forward(self, x):
@@ -30,9 +48,8 @@ class BirdCNN(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        x, y_a, y_b, lam = mixup_data(x, y, alpha=0.4)
         logits = self(x)
-        loss = lam * F.cross_entropy(logits, y_a) + (1 - lam) * F.cross_entropy(logits, y_b)
+        loss = self.focal_loss(logits, y)
         acc = (logits.argmax(dim=1) == y).float().mean()
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
@@ -42,7 +59,7 @@ class BirdCNN(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         logits = self(x)
-        loss = F.cross_entropy(logits, y)
+        loss = self.focal_loss(logits, y)
         acc = (logits.argmax(dim=1) == y).float().mean()
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
@@ -62,10 +79,9 @@ class BirdCNN(pl.LightningModule):
             roc_auc_score(y_true_oh[:, i], all_probs[:, i])
             for i in range(self.num_classes) if y_true_oh[:, i].sum() > 0
         ]
-
         macro_auc = sum(aucs) / len(aucs) if aucs else 0.0
         self.log("val_macro_auc", macro_auc, prog_bar=True)
-        print(f"📈 val_macro_auc = {macro_auc:.4f}")
+        print(f"📈 val_macro_auc (Focal) = {macro_auc:.4f}")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=3e-3)

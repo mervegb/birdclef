@@ -1,83 +1,80 @@
 import os
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from bird_cnn import BirdCNN  
+from bird_cnn import BirdCNN        # For group1 (BCE loss)
+from bird_focal_cnn import BirdFocalCNN  # For group2 (Focal loss)
 
 # ========== CONFIG ========== #
-DATA_DIR = "data/processed/spectrograms"
 BATCH_SIZE = 96
-IMG_SIZE = (128, 512)
-EPOCHS = 100
-LR = 1e-3
+EPOCHS = 50
+IMG_SIZE = (224, 224)
 NUM_WORKERS = os.cpu_count()
-MODEL_WEIGHTS_PATH = "birdnet_weights.pt"
-MODEL_FULL_PATH = "birdnet_model_full.pt"
 
 # ========== TRANSFORMS ========== #
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
 ])
 
-# ========== DATASET ========== #
-dataset = datasets.ImageFolder(root=DATA_DIR, transform=transform)
+# ========== FUNCTION ========== #
+def train_group(group_name):
+    print(f"\n🚀 Training model for {group_name.upper()}...\n")
+    data_dir = f"data/processed/spectrograms_grouped/{group_name}"
+    model_weights_path = f"{group_name}_weights.pt"
+    model_full_path = f"{group_name}_model_full.pt"
 
-# ✅ Avoid empty val set
-val_size = max(1, int(0.2 * len(dataset)))
-train_size = len(dataset) - val_size
+    dataset = datasets.ImageFolder(root=os.path.join(data_dir, "train"), transform=transform)
+    val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, "val"), transform=transform)
 
-train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    num_classes = len(dataset.classes)
+    print(f"📊 Classes in {group_name}: {num_classes}")
 
-print(f"📊 Dataset split: Train={len(train_ds)} | Val={len(val_ds)}")
-print(f"📚 Classes found: {dataset.classes}")
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
-# ========== DATALOADERS ========== #
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    # Choose model
+    if group_name == "group1":
+        model = BirdCNN(num_classes=num_classes)
+    else:
+        model = BirdFocalCNN(num_classes=num_classes)
 
-# ========== MODEL ========== #
-num_classes = len(dataset.classes)
-model = BirdCNN(num_classes=num_classes)
+    # Callbacks
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_macro_auc",
+        filename=f"{group_name}-epoch{{epoch:02d}}-auc{{val_macro_auc:.4f}}",
+        save_top_k=-1,
+        every_n_epochs=1,
+        save_last=True,
+        mode="max"
+    )
+    early_stopping_callback = EarlyStopping(
+        monitor="val_macro_auc",
+        patience=5,
+        mode="max",
+        verbose=True
+    )
 
-# ========== CALLBACKS ========== #
-checkpoint_callback = ModelCheckpoint(
-    monitor="val_macro_auc",
-    filename="birdnet-epoch{epoch:02d}-auc{val_macro_auc:.4f}",
-    save_top_k=-1,            # Save all checkpoints
-    every_n_epochs=1,         # Save every epoch
-    save_last=True,           # (Optional) Save latest separately as last.ckpt
-    mode="max"                # Because higher AUC is better
-)
+    trainer = Trainer(
+        precision=16,
+        max_epochs=EPOCHS,
+        accelerator="auto",
+        callbacks=[checkpoint_callback, early_stopping_callback],
+        log_every_n_steps=10,
+        num_sanity_val_steps=0
+    )
+
+    trainer.fit(model, train_loader, val_loader)
+
+    # Save final model
+    #torch.save(model.state_dict(), model_weights_path)
+    #torch.save(model, model_full_path)
+    print(f"✅ [{group_name.upper()}] Model saved to: {model_full_path}")
 
 
-early_stopping_callback = EarlyStopping(
-    monitor="val_macro_auc",
-    patience=5,
-    mode="max",
-    verbose=True
-)
-
-# ========== TRAINER ========== #
-trainer = Trainer(
-    precision=16,  # Mixed precision
-    max_epochs=EPOCHS,
-    accelerator="auto",  # GPU if available
-    callbacks=[checkpoint_callback, early_stopping_callback],
-    log_every_n_steps=10,
-    num_sanity_val_steps=0
-)
-
-# ========== TRAIN ========== #
-# trainer.fit(model, train_loader, val_loader)
-
-# # ========== SAVE FINAL MODEL ========== #
-# # Save model weights (recommended for deployment/fine-tuning)
-# torch.save(model.state_dict(), MODEL_WEIGHTS_PATH)
-# print(f"✅ Model weights saved to: {MODEL_WEIGHTS_PATH}")
-
-# # Optionally save full model (not portable across different environments)
-# torch.save(model, MODEL_FULL_PATH)
-# print(f"✅ Full model saved to: {MODEL_FULL_PATH}")
+# ========== MAIN LOOP ========== #
+if __name__ == "__main__":
+    for group in ["group1", "group2"]:
+        train_group(group)
