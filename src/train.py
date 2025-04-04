@@ -1,80 +1,95 @@
 import os
+import cv2
+import librosa
+import numpy as np
+import pandas as pd
+import soundfile as sf
+from pathlib import Path
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
+
 import torch
-from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
 from torchvision import datasets, transforms
 from pytorch_lightning import Trainer
+from bird_cnn import BirdCNN 
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from bird_cnn import BirdCNN        # For group1 (BCE loss)
-from bird_focal_cnn import BirdFocalCNN  # For group2 (Focal loss)
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
+# =============================================================================
+#                         PART 2: MODEL TRAINING
+# =============================================================================
 
 # ========== CONFIG ========== #
-BATCH_SIZE = 96
+DATA_DIR = "data/processed/spectrograms"
+BATCH_SIZE = 64              # Adjust batch size as needed
 EPOCHS = 50
 IMG_SIZE = (224, 224)
 NUM_WORKERS = os.cpu_count()
+MODEL_WEIGHTS_PATH = "model_weights.pt"
+MODEL_FULL_PATH = "model_full.pt"
 
-# ========== TRANSFORMS ========== #
-transform = transforms.Compose([
+# ========== DATA AUGMENTATION & TRANSFORMS ========== #
+# NOTE: The following normalization uses placeholder values.
+# For best results, compute the mean and std for your spectrogram dataset.
+train_transforms = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.RandomRotation(degrees=10),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.9, 1.0)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    transforms.RandomErasing(p=0.5, scale=(0.02, 0.1))
+])
+val_transforms = transforms.Compose([
     transforms.Resize(IMG_SIZE),
     transforms.ToTensor(),
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
 ])
 
-# ========== FUNCTION ========== #
-def train_group(group_name):
-    print(f"\n🚀 Training model for {group_name.upper()}...\n")
-    data_dir = f"data/processed/spectrograms_grouped/{group_name}"
-    model_weights_path = f"{group_name}_weights.pt"
-    model_full_path = f"{group_name}_model_full.pt"
+# ========== DATA LOADING ========== #
+train_dataset = datasets.ImageFolder(root=os.path.join(DATA_DIR, "train"), transform=train_transforms)
+val_dataset = datasets.ImageFolder(root=os.path.join(DATA_DIR, "val"), transform=val_transforms)
+print(f"📊 Train size: {len(train_dataset)} | Val size: {len(val_dataset)}")
+print(f"🔢 Number of classes: {len(train_dataset.classes)}")
 
-    dataset = datasets.ImageFolder(root=os.path.join(data_dir, "train"), transform=transform)
-    val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, "val"), transform=transform)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                           num_workers=NUM_WORKERS, persistent_workers=True)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                         num_workers=NUM_WORKERS, persistent_workers=True)
 
-    num_classes = len(dataset.classes)
-    print(f"📊 Classes in {group_name}: {num_classes}")
+# ========== TRAINING ========== #
+# Proceed with training
+model = BirdCNN(num_classes=len(train_dataset.classes))
+    
+checkpoint_callback = ModelCheckpoint(
+    monitor="val_macro_auc",
+    filename="epoch{epoch:02d}-auc{val_macro_auc:.4f}",
+    save_top_k=1,
+    save_last=True,
+    mode="max"
+)
+early_stopping_callback = EarlyStopping(
+    monitor="val_macro_auc",
+    patience=7,
+    mode="max",
+    verbose=True
+)
+trainer = Trainer(
+    precision=16,
+    max_epochs=EPOCHS,
+    accelerator="auto",
+    callbacks=[checkpoint_callback, early_stopping_callback],
+    log_every_n_steps=10,
+    num_sanity_val_steps=0
+)
 
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+# Uncomment to start training:
+# trainer.fit(model, train_loader, val_loader)
 
-    # Choose model
-    if group_name == "group1":
-        model = BirdCNN(num_classes=num_classes)
-    else:
-        model = BirdFocalCNN(num_classes=num_classes)
-
-    # Callbacks
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_macro_auc",
-        filename=f"{group_name}-epoch{{epoch:02d}}-auc{{val_macro_auc:.4f}}",
-        save_top_k=-1,
-        every_n_epochs=1,
-        save_last=True,
-        mode="max"
-    )
-    early_stopping_callback = EarlyStopping(
-        monitor="val_macro_auc",
-        patience=5,
-        mode="max",
-        verbose=True
-    )
-
-    trainer = Trainer(
-        precision=16,
-        max_epochs=EPOCHS,
-        accelerator="auto",
-        callbacks=[checkpoint_callback, early_stopping_callback],
-        log_every_n_steps=10,
-        num_sanity_val_steps=0
-    )
-
-    trainer.fit(model, train_loader, val_loader)
-
-    # Save final model
-    #torch.save(model.state_dict(), model_weights_path)
-    #torch.save(model, model_full_path)
-    print(f"✅ [{group_name.upper()}] Model saved to: {model_full_path}")
-
-
-# ========== MAIN LOOP ========== #
-if __name__ == "__main__":
-    for group in ["group1", "group2"]:
-        train_group(group)
+# After training, save model weights if desired:
+# torch.save(model.state_dict(), MODEL_WEIGHTS_PATH)
+# torch.save(model, MODEL_FULL_PATH)
+# print(f"✅ Model saved to: {MODEL_FULL_PATH}")

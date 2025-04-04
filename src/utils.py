@@ -30,3 +30,35 @@ def is_high_energy(y, sr, threshold_db):
     rms = librosa.feature.rms(y=y)[0]
     energy_db = librosa.amplitude_to_db(rms, ref=np.max)
     return np.mean(energy_db) > -threshold_db
+
+# ========== HELPERS ========== #
+def get_audio_info(filepath):
+    with sf.SoundFile(filepath) as f:
+        return {"frames": f.frames, "sr": f.samplerate, "duration": f.frames / f.samplerate}
+
+
+def compute_melspec(y, sr, n_mels, fmin, fmax):
+    S = lb.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, fmin=fmin, fmax=fmax or sr // 2)
+    return lb.power_to_db(S).astype(np.float32)
+
+
+def mono_to_color(X, eps=1e-6, mean=None, std=None):
+    mean = mean or X.mean()
+    std = std or X.std()
+    X = (X - mean) / (std + eps)
+    _min, _max = X.min(), X.max()
+    if (_max - _min) > eps:
+        V = 255 * (np.clip(X, _min, _max) - _min) / (_max - _min)
+        return V.astype(np.uint8)
+    return np.zeros_like(X, dtype=np.uint8)
+
+
+def crop_or_pad(y, length, is_train=True, start=None):
+    if len(y) < length:
+        n_repeats = length // len(y)
+        remainder = length % len(y)
+        y = np.concatenate([y] * n_repeats + [y[:remainder]])
+    elif len(y) > length:
+        start = start or (np.random.randint(len(y) - length) if is_train else 0)
+        y = y[start:start + length]
+    return y
