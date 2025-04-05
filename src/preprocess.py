@@ -1,145 +1,346 @@
 import os
-import cv2
+from pathlib import Path
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from shutil import copyfile
+from tqdm import tqdm
 import librosa
 import numpy as np
-import pandas as pd
-import soundfile as sf
-from pathlib import Path
+import matplotlib.pyplot as plt
+import cv2
 from multiprocessing import Pool, cpu_count
-from tqdm import tqdm
+import soundfile as sf 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pytorch_lightning as pl
-from torchvision import datasets, transforms
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
 
-# =============================================================================
-#                PART 1: PREPROCESSING & SPECTROGRAM GENERATION
-# =============================================================================
+# ========== CONFIG ==========
+CSV_PATH = "data/train.csv"  # Path to your CSV file
+AUDIO_DIR = Path("data/raw")  # Where the original audio (.ogg) files are stored
+TRAIN_DIR = Path("data/processed/audio/train")  # Destination for training files
+VAL_DIR = Path("data/processed/audio/val")      # Destination for validation files
 
-# ========== CONFIG ========== #
-CSV_PATH = "data/train.csv"                   # CSV containing filenames and labels
-AUDIO_DIR = Path("data/raw")                  # Directory with raw audio files
-OUTPUT_DIR = Path("data/processed/spectrograms")  # Where spectrogram images will be saved
-SAMPLE_RATE = 32000
-CHUNK_DURATION = 5.0     # Reduced from 10.0 to 5.0 seconds for finer segments
-N_MELS = 128
+TRAIN_SEGMENTS_DIR = Path("data/processed/audio/train_segments")
+VAL_SEGMENTS_DIR = Path("data/processed/audio/val_segments")
+TRAIN_SPECTROGRAM_DIR = Path("data/processed/spectrograms/train")
+VAL_SPECTROGRAM_DIR = Path("data/processed/spectrograms/val")
+
+RANDOM_STATE = 42
+
+# Mel spectrogram parameters
 N_FFT = 1024
-HOP_LENGTH = 256       # Smaller hop for better time resolution
+HOP_LENGTH = 500
+N_MELS = 128
 FMIN = 40
 FMAX = 15000
 POWER = 2
 
-# ========== HELPER FUNCTIONS ========== #
-def get_audio_info(filepath):
-    with sf.SoundFile(filepath) as f:
-        return {"frames": f.frames, "sr": f.samplerate, "duration": f.frames / f.samplerate}
-
-def compute_melspec(y, sr, n_mels, fmin, fmax):
-    S = librosa.feature.melspectrogram(
-        y=y, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
-        n_mels=n_mels, fmin=fmin, fmax=fmax, power=POWER
-    )
-    # Convert to decibel scale and normalize with reference to the maximum value
-    S_db = librosa.power_to_db(S, ref=np.max)
-    return S_db.astype(np.float32)
-
-def mono_to_color(X, eps=1e-6):
+def birds_stratified_split(df, target_col, test_size=0.2, rare_threshold=5):
     """
-    Normalize the spectrogram, scale it to 0-255, and then apply a color map.
+    Splits the DataFrame into train and validation sets in a stratified way,
+    adding classes with fewer than `rare_threshold` clips exclusively to the training set.
     """
-    X_norm = (X - X.mean()) / (X.std() + eps)
-    X_scaled = 255 * (X_norm - X_norm.min()) / (X_norm.max() - X_norm.min() + eps)
-    X_uint8 = X_scaled.astype(np.uint8)
-    # Apply a color map for improved visual representation
-    color_mapped = cv2.applyColorMap(X_uint8, cv2.COLORMAP_JET)
-    # Convert BGR (OpenCV default) to RGB
-    color_mapped = cv2.cvtColor(color_mapped, cv2.COLOR_BGR2RGB)
-    return color_mapped
-
-def crop_or_pad(y, length, is_train=True, start=None):
-    if len(y) < length:
-        n_repeats = length // len(y)
-        remainder = length % len(y)
-        y = np.concatenate([y] * n_repeats + [y[:remainder]])
-    elif len(y) > length:
-        start = start or (np.random.randint(len(y) - length) if is_train else 0)
-        y = y[start:start + length]
-    return y
-
-# ========== DATA SPLITTING ========== #
-def stratified_birdclef_split(df, target_col='primary_label', test_size=0.2):
+    # Count clips per species
     class_counts = df[target_col].value_counts()
-    low_count_classes = class_counts[class_counts < 2].index.tolist()
-    df['keep'] = df[target_col].isin(low_count_classes)
-    strat_df = df[~df['keep']]
+    # Identify rare classes with fewer than rare_threshold clips
+    rare_classes = class_counts[class_counts < rare_threshold].index.tolist()
+    print("Rare classes (less than {} clips):".format(rare_threshold))
+    print(rare_classes)
+    
+    # Flag rows belonging to rare classes
+    df['train_flag'] = df[target_col].isin(rare_classes)
+    
+    # Stratified split on classes with sufficient samples
     train_df, val_df = train_test_split(
-        strat_df,
+        df[~df['train_flag']],
         test_size=test_size,
-        stratify=strat_df[target_col],
-        random_state=42
+        stratify=df[~df['train_flag']][target_col],
+        random_state=RANDOM_STATE
     )
-    train_df = pd.concat([train_df, df[df['keep']]], axis=0).reset_index(drop=True)
-    train_df.drop(columns='keep', inplace=True)
-    val_df.drop(columns='keep', inplace=True)
+    
+    # Add rare classes exclusively to the training set
+    train_df = pd.concat([train_df, df[df['train_flag']]], axis=0).reset_index(drop=True)
+    
+    # Remove the helper flag
+    train_df.drop('train_flag', axis=1, inplace=True)
+    val_df.drop('train_flag', axis=1, inplace=True)
+    
     return train_df, val_df
 
-# ========== MEL GENERATION ========== #
-def process_row(row_dict_mode):
-    row_dict, mode = row_dict_mode
-    row = pd.Series(row_dict)
-    try:
-        audio_path = AUDIO_DIR / row["filename"]
-        y, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
-        chunk_samples = int(CHUNK_DURATION * sr)
-
-        for i in range(0, len(y), chunk_samples):
-            clip = y[i:i + chunk_samples]
-            if len(clip) < chunk_samples:
-                continue
-
-            # Compute the mel-spectrogram
-            mel = compute_melspec(y=clip, sr=sr, n_mels=N_MELS, fmin=FMIN, fmax=FMAX)
-            # Convert single-channel spectrogram to a colored image
-            mel_img = mono_to_color(mel)
-            # Flip vertically to match conventional spectrogram orientation
-            mel_img = np.flip(mel_img, axis=0)
-
-            # Save image in a folder corresponding to its label
-            class_name = row["primary_label"]
-            out_dir = OUTPUT_DIR / mode / class_name
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{row.name}_chunk{i // chunk_samples}.png"
-            # cv2.imwrite expects BGR format
-            cv2.imwrite(str(out_path), cv2.cvtColor(mel_img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_PNG_COMPRESSION, 0])
-    except Exception as e:
-        print(f"❌ [{row.name}] Error: {e}")
-
-# ========== MAIN RUN FOR PREPROCESSING ========== #
-def generate_spectrograms():
+def split_audio_dataset():
+    # Load CSV data
     df = pd.read_csv(CSV_PATH)
-    print("📊 Loaded CSV:", df.shape)
-    print(df.head())
+    print("Loaded CSV with shape:", df.shape)
+    
+    # Display class counts for overview
+    class_counts = df["primary_label"].value_counts()
+    print("Overall class counts:")
+    print(class_counts)
+    
+    # Perform the stratified split using our function (rare classes with <10 clips go to training)
+    train_df, val_df = birds_stratified_split(df, target_col="primary_label", test_size=0.2, rare_threshold=5)
+    
+    print("Final training set shape:", train_df.shape)
+    print("Final validation set shape:", val_df.shape)
+    
+    # Copy training files with a progress bar
+    print("Copying training files...")
+    for _, row in tqdm(train_df.iterrows(), total=len(train_df)):
+        filename = Path(row["filename"]).name  # Flatten subfolders by taking only the base filename
+        label = row["primary_label"]
+        src_path = AUDIO_DIR / row["filename"]
+        dest_dir = TRAIN_DIR / label
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / filename
+        if not src_path.exists():
+            print(f"File {src_path} not found. Skipping.")
+            continue
+        copyfile(str(src_path), str(dest_path))
+    
+    # Copy validation files with a progress bar
+    print("Copying validation files...")
+    for _, row in tqdm(val_df.iterrows(), total=len(val_df)):
+        filename = Path(row["filename"]).name
+        label = row["primary_label"]
+        src_path = AUDIO_DIR / row["filename"]
+        dest_dir = VAL_DIR / label
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / filename
+        if not src_path.exists():
+            print(f"File {src_path} not found. Skipping.")
+            continue
+        copyfile(str(src_path), str(dest_path))
+    
+    print("Dataset split complete.")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print("🚀 Splitting dataset...")
-    train_df, val_df = stratified_birdclef_split(df, target_col="primary_label", test_size=0.2)
-    train_jobs = [(row, "train") for _, row in train_df.iterrows()]
-    val_jobs = [(row, "val") for _, row in val_df.iterrows()]
-    all_jobs = train_jobs + val_jobs
+def compute_rms(signal):
+    """Compute root-mean-square (RMS) of an audio signal."""
+    return np.sqrt(np.mean(signal ** 2))
 
-    print(f"🔁 Processing {len(all_jobs)} audio chunks using {cpu_count()} cores...")
+def dbfs(signal):
+    """Convert RMS to dBFS (decibels relative to full scale, assuming a maximum of 1.0)."""
+    rms_val = compute_rms(signal)
+    # Adding a small epsilon to avoid log(0)
+    return 20 * np.log10(rms_val + 1e-6)
+
+def segment_audio_with_overlap(audio_path, sr=32000, window_size=5, step_size=1, snr_threshold_db=-20):
+    """
+    Splits the audio into overlapping segments.
+    
+    Parameters:
+    - audio_path: path to the audio file.
+    - sr: sample rate.
+    - window_size: length of each segment in seconds.
+    - step_size: sliding window step size in seconds (e.g., 1 second).
+    - snr_threshold_db: minimum dBFS threshold; segments below this are considered low-energy (noisy) and skipped.
+    
+    Returns:
+    - segments: a list of audio segments that pass the energy filter.
+    - segment_indices: the start sample index for each segment.
+    """
+    y, sr = librosa.load(audio_path, sr=sr)
+    segment_length = int(sr * window_size)
+    step = int(sr * step_size)
+    
+    segments = []
+    segment_indices = []
+    
+    # Slide over the audio with the specified step
+    for start in range(0, len(y) - segment_length + 1, step):
+        segment = y[start:start + segment_length]
+        level_db = dbfs(segment)
+        # Only keep segments that have enough energy (i.e., above the threshold)
+        if level_db < snr_threshold_db:
+            continue
+        segments.append(segment)
+        segment_indices.append(start)
+    
+    return segments, segment_indices
+
+def process_audio_directory(
+    source_dir: Path,
+    output_dir: Path,
+    sr=32000,
+    window_size=5,
+    step_size=1,
+    snr_threshold_db=-20
+):
+    """
+    Loops through all .ogg files in source_dir, segments each one,
+    and saves the resulting segments to output_dir in a mirrored folder structure.
+    """
+    # Recursively find all .ogg files in the source directory
+    audio_files = list(source_dir.rglob("*.ogg"))
+    print(f"Found {len(audio_files)} audio files in {source_dir}.")
+
+    for audio_path in audio_files:
+        # Segment the audio
+        segments, indices = segment_audio_with_overlap(
+            audio_path,
+            sr=sr,
+            window_size=window_size,
+            step_size=step_size,
+            snr_threshold_db=snr_threshold_db
+        )
+
+        if not segments:
+            # If no segments pass the threshold, skip
+            continue
+
+        # Build a relative path for where to save segments
+        # Example: if audio_path is "train/21038/iNat65519.ogg",
+        # we want to create something like "train_segments/21038" in the output dir
+        relative_path = audio_path.relative_to(source_dir)
+        parent_folder = relative_path.parent  # e.g. "21038"
+        filename_stem = audio_path.stem       # e.g. "iNat65519"
+
+        # Create the output subdirectory (mirroring class labels, etc.)
+        output_subdir = output_dir / parent_folder
+        output_subdir.mkdir(parents=True, exist_ok=True)
+
+        # Save each segment
+        for i, segment in enumerate(segments):
+            segment_filename = f"{filename_stem}_seg{i}.wav"
+            segment_path = output_subdir / segment_filename
+
+            # Write the audio to disk as a .wav file
+            sf.write(str(segment_path), segment, sr)
+            # Alternatively, if you prefer .ogg output, you'll need a library that supports OGG writing
+            # but .wav is standard for ML pipelines.
+
+        print(f"Saved {len(segments)} segments from {audio_path} to {output_subdir}")
+
+def generate_spectrogram(audio_path, output_path):
+    """
+    Loads an audio segment from audio_path, computes its mel spectrogram,
+    converts to decibels, normalizes it to grayscale (0-255) and saves it as a PNG.
+    """
+    try:
+        # Load audio file
+        y, _ = librosa.load(str(audio_path), sr=SR)
+        
+        # Compute mel spectrogram
+        mel_spec = librosa.feature.melspectrogram(
+            y=y,
+            sr=SR,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
+            n_mels=N_MELS,
+            fmin=FMIN,
+            fmax=FMAX,
+            power=POWER
+        )
+        # Convert to dB scale
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        # Normalize to 0-255 for grayscale image
+        norm_img = 255 * (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min())
+        norm_img = norm_img.astype(np.uint8)
+        
+        # Ensure the output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save the image as PNG
+        cv2.imwrite(str(output_path), norm_img)
+        return f"Processed: {audio_path.name}"
+    except Exception as e:
+        return f"Error processing {audio_path}: {e}"
+
+def process_directory(source_dir: Path, dest_dir: Path):
+    """
+    Process all .wav audio files in source_dir (recursively) and generate spectrograms in dest_dir.
+    The folder structure is mirrored.
+    """
+    # Find all .wav files in the source directory recursively
+    audio_files = list(source_dir.rglob("*.wav"))
+    print(f"Found {len(audio_files)} audio files in {source_dir}")
+    
+    # Prepare jobs as tuples: (audio file path, destination path)
+    jobs = []
+    for audio_path in audio_files:
+        # Mirror the relative folder structure in dest_dir.
+        relative_path = audio_path.relative_to(source_dir)
+        # Replace the audio extension with .png
+        output_path = dest_dir / relative_path.with_suffix(".png")
+        jobs.append((audio_path, output_path))
+    
+    # Process files in parallel
+    def process_job(job):
+        audio_path, output_path = job
+        return generate_spectrogram(audio_path, output_path)
+    
     with Pool(cpu_count()) as pool:
-        list(tqdm(pool.imap_unordered(process_row, all_jobs), total=len(all_jobs)))
-    print("✅ Done — spectrograms saved to:", OUTPUT_DIR)
+        results = list(tqdm(pool.imap_unordered(process_job, jobs), total=len(jobs)))
+    
+    for res in results:
+        print(res)
 
-# Uncomment the following line to run spectrogram generation:
+
 if __name__ == '__main__':
-    import multiprocessing
-    multiprocessing.freeze_support()
-    generate_spectrograms()
+    # 1) Split the dataset (comment this out if already done)
+    # split_audio_dataset()
+
+    # 2) Segment all audio in train and val
+    # TRAIN_DIR = Path("data/processed/audio/train")
+    # VAL_DIR = Path("data/processed/audio/val")
+
+    # process_audio_directory(
+    #     source_dir=TRAIN_DIR,
+    #     output_dir=TRAIN_SEGMENTS_DIR,
+    #     sr=32000,
+    #     window_size=5,
+    #     step_size=1,
+    #     snr_threshold_db=-20
+    # )
+
+    # process_audio_directory(
+    #     source_dir=VAL_DIR,
+    #     output_dir=VAL_SEGMENTS_DIR,
+    #     sr=32000,
+    #     window_size=5,
+    #     step_size=1,
+    #     snr_threshold_db=-20
+    # )
+    
+    # 3) Visualize the segment
+    # audio_path = "data/raw/rugdov/iNat133910.ogg"
+    # y, sr = librosa.load(audio_path, sr=32000)
+    # print("Audio duration (seconds):", len(y) / sr)
+    # print("Overall dBFS:", dbfs(y))
+
+    # # Get segments using the sliding window approach
+    # segments, indices = segment_audio_with_overlap(audio_path, sr=32000, window_size=5, step_size=1, snr_threshold_db=-40)
+    # print("Number of segments found:", len(segments))
+    # print("Segment start indices:", indices)
+
+    # # Plot the full waveform
+    # plt.figure(figsize=(12, 6))
+    # librosa.display.waveshow(y, sr=sr, alpha=0.6)
+    # plt.xlabel("Time (s)")
+    # plt.ylabel("Amplitude")
+    # plt.title("Full Audio Waveform with Sliding Window Segmentation")   
+
+    # segment = segments[0]  # for example, the first segment
+
+    # # Compute the STFT for the segment
+    # S_seg = librosa.stft(segment)
+    # S_seg_db = librosa.amplitude_to_db(np.abs(S_seg), ref=np.max)
+
+    # plt.figure(figsize=(12, 8))
+    # librosa.display.specshow(S_seg_db, sr=sr, x_axis='time', y_axis='log', cmap='viridis')
+    # plt.colorbar(format='%+2.0f dB')
+    # plt.title("Spectrogram of Segment 0")
+    # plt.tight_layout()
+    # plt.savefig("segment0_spectrogram.png", bbox_inches='tight')
+    # plt.show()
+    
+    # 4. Spectrogram generation
+    # Generate spectrograms for training segments
+    print("Processing training spectrograms...")
+    process_directory(TRAIN_SEGMENTS_DIR, TRAIN_SPECTROGRAM_DIR)
+    
+    # Generate spectrograms for validation segments
+    print("Processing validation spectrograms...")
+    process_directory(VAL_SEGMENTS_DIR, VAL_SPECTROGRAM_DIR)
+    
+    print("Spectrogram generation complete.")
+    
+            
