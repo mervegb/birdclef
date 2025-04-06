@@ -12,3 +12,4 @@ jupyter
 pydub
 pytorch_lightning
 opencv-python
+timm
