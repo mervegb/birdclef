@@ -13,3 +13,4 @@ pydub
 pytorch_lightning
 opencv-python
 timm
+tensorboard

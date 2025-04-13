@@ -27,8 +27,8 @@ RANDOM_STATE = 42
 N_FFT = 1024
 HOP_LENGTH = 500
 N_MELS = 128
-FMIN = 40
-FMAX = 15000
+FMIN = 50
+FMAX = 16000
 POWER = 2
 SR = 32000  # sample rate
 
@@ -57,9 +57,6 @@ def birds_stratified_split(df, target_col, test_size=0.2, rare_threshold=5):
 def split_audio_dataset():
     df = pd.read_csv(CSV_PATH)
     print("Loaded CSV with shape:", df.shape)
-    print("Overall class counts:")
-    print(df["primary_label"].value_counts())
-    
     train_df, val_df = birds_stratified_split(df, target_col="primary_label", test_size=0.2, rare_threshold=5)
     print("Final training set shape:", train_df.shape)
     print("Final validation set shape:", val_df.shape)
@@ -137,7 +134,10 @@ def process_audio_directory(source_dir: Path, output_dir: Path, sr=32000, window
 
 def generate_spectrogram(audio_path, output_path):
     try:
+        # Load audio
         y, _ = librosa.load(str(audio_path), sr=SR)
+
+        # Generate mel spectrogram
         mel_spec = librosa.feature.melspectrogram(
             y=y,
             sr=SR,
@@ -148,10 +148,16 @@ def generate_spectrogram(audio_path, output_path):
             fmax=FMAX,
             power=POWER
         )
+
+        # Convert to decibel scale
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-        # Normalize to 0-1 float range and then scale to 255 for a PNG
-        norm_img = 255 * (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min())
-        norm_img = norm_img.astype(np.uint8)
+
+        # Normalize to 0–255 and convert to uint8
+        mel_norm = (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min())
+        norm_img = (mel_norm * 255).astype(np.uint8)
+
+        # Save image
+        output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(output_path), norm_img)
         return f"Processed: {audio_path.name}"
