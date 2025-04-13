@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import timm
 import librosa
 import numpy as np
@@ -25,14 +25,14 @@ import pandas.api.types
 config = {
     "sample_rate": 32000,
     "amplification_factor": 1024,
-    "chunk_duration": 10,       # seconds per sample
+    "chunk_duration": 5,       # seconds per sample
     "n_fft": 1024,
     "hop_length": 500,
     "n_mels": 128,
     "fmin": 50,
     "fmax": 16000,
     "power": 2.0,
-    "spec_width": 640,          # fixed time frames for mel spectrogram
+    "spec_width": 640,         # used previously; now we remove fixed cropping/padding
     "model_name": "tf_efficientnet_b0",
     "num_classes": 206,
     "data_train_csv": "data/train.csv",
@@ -42,7 +42,7 @@ config = {
 }
 
 training_config = {
-    "epochs": 10,             # Increased epochs for longer training
+    "epochs": 20,             # Increased epochs for longer training
     "num_folds": 3,
     "batch_size": 8,
     "val_batch_size": 16,
@@ -60,19 +60,16 @@ class ParticipantVisibleError(Exception):
 
 def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: str) -> float:
     """
-    Macro-averaged ROC-AUC score ignoring classes with no positive labels (Kaggle BirdCLEF style).
+    Macro-averaged ROC-AUC score ignoring classes with no positive labels.
     """
     del solution[row_id_column_name]
     del submission[row_id_column_name]
-
     if not pd.api.types.is_numeric_dtype(submission.values):
         bad_dtypes = {x: submission[x].dtype for x in submission.columns if not pd.api.types.is_numeric_dtype(submission[x])}
         raise ParticipantVisibleError(f"Invalid submission data types found: {bad_dtypes}")
-
     solution_sums = solution.sum(axis=0)
     scored_columns = list(solution_sums[solution_sums > 0].index.values)
     assert len(scored_columns) > 0
-
     return kaggle_metric_utilities.safe_call_score(
         sklearn.metrics.roc_auc_score,
         solution[scored_columns].values,
@@ -81,22 +78,15 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
     )
 
 def cal_score(labels, preds, label_mapper):
-    # Concatenate list of arrays.
     labels = np.concatenate(labels)
     preds = np.concatenate(preds)
-    
-    # Use the keys from label_mapper.
     columns = list(label_mapper.keys())
-    # If the number of columns in preds does not match, adjust column names.
     if preds.shape[1] != len(columns):
         columns = [str(i) for i in range(preds.shape[1])]
-    
     labels_df = pd.DataFrame((labels > 0.5).astype(int), columns=columns)
     pred_df = pd.DataFrame(preds, columns=columns)
-    
     labels_df['id'] = np.arange(len(labels_df))
     pred_df['id'] = np.arange(len(pred_df))
-    
     return score(labels_df, pred_df, row_id_column_name='id')
 
 ########################################
@@ -109,7 +99,7 @@ class BirdCLEFDataset(Dataset):
         self.mode = mode
         self.audio_dir = Path(audio_dir)
         self.file_paths = self.df["filename"].apply(lambda x: self.audio_dir / x).tolist()
-
+        
         if "primary_label" in self.df.columns:
             unique_labels = sorted(self.df["primary_label"].unique())
             self.label_mapper = {label: idx for idx, label in enumerate(unique_labels)}
@@ -148,18 +138,13 @@ class BirdCLEFDataset(Dataset):
         )
         mel_sp = librosa.power_to_db(mel_sp, ref=1)
         mel_sp = (mel_sp - mel_sp.min()) / (mel_sp.max() - mel_sp.min() + 1e-12)
-
-        if mel_sp.shape[1] >= config["spec_width"]:
-            mel_sp = mel_sp[:, :config["spec_width"]]
-        else:
-            pad = config["spec_width"] - mel_sp.shape[1]
-            mel_sp = np.pad(mel_sp, ((0, 0), (0, pad)), mode="constant")
+        # Removed fixed cropping/padding; return variable width mel spectrogram.
         return mel_sp
 
     def __getitem__(self, idx):
         audio_path = self.file_paths[idx]
         spectrogram = self.process(audio_path)
-        x = torch.tensor(spectrogram, dtype=torch.float).unsqueeze(0)  # [1, 128, spec_width]
+        x = torch.tensor(spectrogram, dtype=torch.float).unsqueeze(0)  # shape: [1, 128, variable_width]
         if self.mode == "train" and self.labels is not None:
             return x, self.labels[idx]
         return x
@@ -174,7 +159,7 @@ class Model(nn.Module):
         self.base_model = timm.create_model(
             model_name=model_name,
             num_classes=config["num_classes"],
-            pretrained=False,
+            pretrained=True,  # Use pretrained weights for fine-tuning.
             in_chans=1,
         )
 
@@ -191,11 +176,9 @@ if __name__ == "__main__":
     df = data_df.sample(1000, random_state=config["random_state"]).reset_index(drop=True)
 
     # 2. Stratified K-fold splitting.
-    skf = StratifiedKFold(
-        n_splits=training_config["num_folds"],
-        shuffle=True,
-        random_state=config["random_state"]
-    )
+    skf = StratifiedKFold(n_splits=training_config["num_folds"],
+                          shuffle=True,
+                          random_state=config["random_state"])
     df["kfold"] = -1
     for fold, (train_idx, val_idx) in enumerate(skf.split(df, df[training_config["target_col"]])):
         df.loc[val_idx, "kfold"] = fold
@@ -252,7 +235,6 @@ if __name__ == "__main__":
 
                 running_loss += loss.item() * x_batch.size(0)
 
-                # Accumulate training predictions and one-hot labels.
                 probs = torch.softmax(outputs, dim=1)
                 pred_train.append(probs.detach().cpu().numpy())
                 one_hot_y = torch.nn.functional.one_hot(y_batch, num_classes=config["num_classes"]).float()
@@ -305,40 +287,40 @@ if __name__ == "__main__":
                 torch.save(model.state_dict(), f"model_fold_{fold}_epoch_{epoch}_effnetB0_val_auc_{auc_val:.4f}_val_loss_{avg_val_loss:.4f}.pth")
                 print(f"  -> Saved best model for fold {fold} with Val AUC: {auc_val:.4f}")
 
-    # 6. (Optional) Demonstration: Compute Kaggle AUC on a small sample.
-    sample_df = df.sample(config["sample_size"], random_state=config["random_state"]).reset_index(drop=True)
-    sample_ds = BirdCLEFDataset(sample_df, config["audio_dir"], mode="train")
+    # # 6. (Optional) Demonstration: Compute Kaggle AUC on a small sample.
+    # sample_df = df.sample(config["sample_size"], random_state=config["random_state"]).reset_index(drop=True)
+    # sample_ds = BirdCLEFDataset(sample_df, config["audio_dir"], mode="train", augment=False)
 
-    # Load final model from last fold (for demonstration).
-    model = Model().to(training_config["device"])
-    model.load_state_dict(torch.load("model_fold_2_epoch_7_effnetB0_val_auc_0.5196_val_loss_7.2958.pth"))
-    model.eval()
+    # # Load final model from last fold (for demonstration).
+    # model = Model().to(training_config["device"])
+    # model.load_state_dict(torch.load(f"model_fold_{training_config['num_folds']-1}.pth"))
+    # model.eval()
 
-    label_mapper = sample_ds.label_mapper
-    rev_mapper = sample_ds.reverse_label_mapper
-    all_labels, all_preds = [], []
-    with torch.no_grad():
-        for i in range(len(sample_ds)):
-            x, y = sample_ds[i]
-            x = x.unsqueeze(0).to(training_config["device"])
-            outputs = model(x)
-            probs = torch.softmax(outputs, dim=1).cpu().numpy()
-            pred_idx = np.argmax(probs, axis=1).item()
+    # label_mapper = sample_ds.label_mapper
+    # rev_mapper = sample_ds.reverse_label_mapper
+    # all_labels, all_preds = [], []
+    # with torch.no_grad():
+    #     for i in range(len(sample_ds)):
+    #         x, y = sample_ds[i]
+    #         x = x.unsqueeze(0).to(training_config["device"])
+    #         outputs = model(x)
+    #         probs = torch.softmax(outputs, dim=1).cpu().numpy()
+    #         pred_idx = np.argmax(probs, axis=1).item()
 
-            actual_label = rev_mapper[y]
-            predicted_label = rev_mapper.get(pred_idx, f"id_{pred_idx}")
-            print(f"Sample {i}: Predicted: {predicted_label} | Actual: {actual_label}")
+    #         actual_label = rev_mapper[y]
+    #         predicted_label = rev_mapper.get(pred_idx, f"id_{pred_idx}")
+    #         print(f"Sample {i}: Predicted: {predicted_label} | Actual: {actual_label}")
 
-            one_hot_true = np.zeros((1, len(label_mapper)))
-            one_hot_true[0, y] = 1.0
-            one_hot_pred = np.zeros((1, len(label_mapper)))
-            one_hot_pred[0, pred_idx] = 1.0
+    #         one_hot_true = np.zeros((1, len(label_mapper)))
+    #         one_hot_true[0, y] = 1.0
+    #         one_hot_pred = np.zeros((1, len(label_mapper)))
+    #         one_hot_pred[0, pred_idx] = 1.0
 
-            all_labels.append(one_hot_true)
-            all_preds.append(one_hot_pred)
+    #         all_labels.append(one_hot_true)
+    #         all_preds.append(one_hot_pred)
 
-    try:
-        auc_score = cal_score(np.concatenate(all_labels, axis=0), np.concatenate(all_preds, axis=0), label_mapper)
-        print(f"Overall Kaggle Macro AUC Score on sample: {auc_score:.4f}")
-    except Exception as e:
-        print(f"Error computing AUC on sample: {e}")
+    # try:
+    #     auc_score = cal_score(np.concatenate(all_labels, axis=0), np.concatenate(all_preds, axis=0), label_mapper)
+    #     print(f"Overall Kaggle Macro AUC Score on sample: {auc_score:.4f}")
+    # except Exception as e:
+    #     print(f"Error computing AUC on sample: {e}")
