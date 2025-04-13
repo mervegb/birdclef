@@ -16,7 +16,7 @@ filterwarnings("ignore")
 # Kaggle metric utilities 
 import kaggle_metric_utilities
 import sklearn.metrics
-
+import pandas.api.types
 
 ########################################
 #              CONFIG                #
@@ -80,12 +80,19 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
         average="macro",
     )
 
-def cal_score(labels, preds):
+def cal_score(labels, preds, label_mapper):
+    # Concatenate list of arrays.
     labels = np.concatenate(labels)
     preds = np.concatenate(preds)
     
-    labels_df = pd.DataFrame(labels > 0.5, columns = list(label_mapper.keys()))
-    pred_df = pd.DataFrame(preds, columns=list(label_mapper.keys()))
+    # Use the keys from label_mapper.
+    columns = list(label_mapper.keys())
+    # If the number of columns in preds does not match, adjust column names.
+    if preds.shape[1] != len(columns):
+        columns = [str(i) for i in range(preds.shape[1])]
+    
+    labels_df = pd.DataFrame((labels > 0.5).astype(int), columns=columns)
+    pred_df = pd.DataFrame(preds, columns=columns)
     
     labels_df['id'] = np.arange(len(labels_df))
     pred_df['id'] = np.arange(len(pred_df))
@@ -248,13 +255,12 @@ if __name__ == "__main__":
                 # Accumulate training predictions and one-hot labels.
                 probs = torch.softmax(outputs, dim=1)
                 pred_train.append(probs.detach().cpu().numpy())
-                # Use torch.nn.functional.one_hot for proper one-hot conversion.
                 one_hot_y = torch.nn.functional.one_hot(y_batch, num_classes=config["num_classes"]).float()
                 label_train.append(one_hot_y.cpu().numpy())
 
             epoch_loss = running_loss / len(train_loader.dataset)
             try:
-                auc_train = cal_score(label_train, pred_train)
+                auc_train = cal_score(label_train, pred_train, train_ds.label_mapper)
             except Exception as e:
                 auc_train = f"Error: {e}"
             print(f"Fold {fold} | Epoch {epoch} | Train Loss: {epoch_loss:.4f} | Train AUC: {auc_train}")
@@ -274,7 +280,6 @@ if __name__ == "__main__":
                     outputs = model(x_batch)
                     loss_val = criterion(outputs, y_batch)
                     running_val_loss += loss_val.item() * x_batch.size(0)
-
                     probs = torch.softmax(outputs, dim=1)
                     _, preds = torch.max(probs, 1)
                     total += y_batch.size(0)
@@ -288,7 +293,7 @@ if __name__ == "__main__":
             avg_val_loss = running_val_loss / len(val_loader.dataset)
 
             try:
-                auc_val = cal_score(label_val, pred_val)
+                auc_val = cal_score(label_val, pred_val, val_ds.label_mapper)
             except Exception as e:
                 auc_val = f"Error: {e}"
 
@@ -306,7 +311,7 @@ if __name__ == "__main__":
 
     # Load final model from last fold (for demonstration).
     model = Model().to(training_config["device"])
-    model.load_state_dict(torch.load(f"model_fold_{training_config['num_folds']-1}.pth"))
+    model.load_state_dict(torch.load("model_fold_2_epoch_7_effnetB0_val_auc_0.5196_val_loss_7.2958.pth"))
     model.eval()
 
     label_mapper = sample_ds.label_mapper
@@ -333,7 +338,7 @@ if __name__ == "__main__":
             all_preds.append(one_hot_pred)
 
     try:
-        auc_score = cal_score(np.concatenate(all_labels, axis=0), np.concatenate(all_preds, axis=0))
+        auc_score = cal_score(np.concatenate(all_labels, axis=0), np.concatenate(all_preds, axis=0), label_mapper)
         print(f"Overall Kaggle Macro AUC Score on sample: {auc_score:.4f}")
     except Exception as e:
         print(f"Error computing AUC on sample: {e}")
