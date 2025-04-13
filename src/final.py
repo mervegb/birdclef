@@ -10,10 +10,13 @@ from pathlib import Path
 from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm  # For progress bars
 
-# Kaggle metric utilities (as in your script)
+from warnings import filterwarnings
+filterwarnings("ignore")
+
+# Kaggle metric utilities 
 import kaggle_metric_utilities
 import sklearn.metrics
-import pandas.api.types
+
 
 ########################################
 #              CONFIG                #
@@ -39,7 +42,7 @@ config = {
 }
 
 training_config = {
-    "epochs": 10,             # Increased from 1 to 10 epochs for longer training
+    "epochs": 10,             # Increased epochs for longer training
     "num_folds": 3,
     "batch_size": 8,
     "val_batch_size": 16,
@@ -84,10 +87,10 @@ def cal_score(labels, preds):
     labels_df = pd.DataFrame(labels > 0.5, columns = list(label_mapper.keys()))
     pred_df = pd.DataFrame(preds, columns=list(label_mapper.keys()))
     
-    label_df['id'] = np.arange(len(labels_df))
+    labels_df['id'] = np.arange(len(labels_df))
     pred_df['id'] = np.arange(len(pred_df))
     
-    return score(label_df, pred_df, row_id_column_name='id')
+    return score(labels_df, pred_df, row_id_column_name='id')
 
 ########################################
 #         DATASET DEFINITION           #
@@ -190,7 +193,7 @@ if __name__ == "__main__":
     for fold, (train_idx, val_idx) in enumerate(skf.split(df, df[training_config["target_col"]])):
         df.loc[val_idx, "kfold"] = fold
 
-    # (Optional) Save CSV with kfold column.
+    # (Optional) Save CSV with 'kfold' column.
     new_csv_path = "data/train_kfold.csv"
     df.to_csv(new_csv_path, index=False)
     print(f"Saved CSV with kfold column at {new_csv_path}")
@@ -213,95 +216,124 @@ if __name__ == "__main__":
             shuffle=False, num_workers=2, drop_last=False
         )
 
-        # Initializing model
-        model = Model(name=config['model_name']).to(training_config["device"])
+        # 4. Create model, optimizer, criterion.
+        model = Model().to(training_config["device"])
         optimizer = torch.optim.Adam(model.parameters(), lr=training_config["lr"])
         criterion = nn.CrossEntropyLoss()
 
         best_auc = 0
 
-        # Per fold training
+        # 5. Epoch loop.
         for epoch in range(training_config["epochs"]):
             print(f"\nEpoch {epoch} / {training_config['epochs']-1}")
             model.train()
-            
-            pred_train = []
-            label_train = []
-            
             running_loss = 0.0
 
-            # --- TRAINING ---
-            for x, y in tqdm(train_loader, desc="Training"):
-                x = x.to(training_config["device"])
-                y = y.to(training_config["device"])
+            pred_train = []
+            label_train = []
 
-                # Converting to one hot encoding  
-                y_one_hot = nn.functional(
-                    y,
-                    num_classes = config['num_classes']
-                ).float()      
+            # --- TRAINING ---
+            for x_batch, y_batch in tqdm(train_loader, desc="Training", leave=False):
+                x_batch = x_batch.to(training_config["device"])
+                y_batch = y_batch.to(training_config["device"])
 
                 optimizer.zero_grad()
-                outputs = model(x)
-               
-                loss = criterion(outputs, y)
-                loss.backward() # backpropagation
+                outputs = model(x_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
                 optimizer.step()
 
-                running_loss += loss.item() 
-                props = torch.softmax(outputs, dim=1)
-                pred_train.append(props.detach().cpu().numpy())
-                label_train.append()
-                
-            
-    # --- VALIDATION ---
+                running_loss += loss.item() * x_batch.size(0)
+
+                # Accumulate training predictions and one-hot labels.
+                probs = torch.softmax(outputs, dim=1)
+                pred_train.append(probs.detach().cpu().numpy())
+                # Use torch.nn.functional.one_hot for proper one-hot conversion.
+                one_hot_y = torch.nn.functional.one_hot(y_batch, num_classes=config["num_classes"]).float()
+                label_train.append(one_hot_y.cpu().numpy())
+
+            epoch_loss = running_loss / len(train_loader.dataset)
+            try:
+                auc_train = cal_score(label_train, pred_train)
+            except Exception as e:
+                auc_train = f"Error: {e}"
+            print(f"Fold {fold} | Epoch {epoch} | Train Loss: {epoch_loss:.4f} | Train AUC: {auc_train}")
+
+            # --- VALIDATION ---
+            model.eval()
+            correct = 0
+            total = 0
+            pred_val = []
+            label_val = []
+            running_val_loss = 0.0
+
+            with torch.no_grad():
+                for x_batch, y_batch in tqdm(val_loader, desc="Validation", leave=False):
+                    x_batch = x_batch.to(training_config["device"])
+                    y_batch = y_batch.to(training_config["device"])
+                    outputs = model(x_batch)
+                    loss_val = criterion(outputs, y_batch)
+                    running_val_loss += loss_val.item() * x_batch.size(0)
+
+                    probs = torch.softmax(outputs, dim=1)
+                    _, preds = torch.max(probs, 1)
+                    total += y_batch.size(0)
+                    correct += (preds == y_batch).sum().item()
+
+                    pred_val.append(probs.detach().cpu().numpy())
+                    one_hot_y_val = torch.nn.functional.one_hot(y_batch, num_classes=config["num_classes"]).float()
+                    label_val.append(one_hot_y_val.cpu().numpy())
+
+            val_acc = correct / total if total > 0 else 0
+            avg_val_loss = running_val_loss / len(val_loader.dataset)
+
+            try:
+                auc_val = cal_score(label_val, pred_val)
+            except Exception as e:
+                auc_val = f"Error: {e}"
+
+            print(f"Fold {fold} | Epoch {epoch} | Validation Loss: {avg_val_loss:.4f} | Validation Acc: {val_acc:.4f} | Validation AUC: {auc_val}")
+
+            # Checkpointing: Save best model based on validation AUC.
+            if isinstance(auc_val, float) and auc_val > best_auc:
+                best_auc = auc_val
+                torch.save(model.state_dict(), f"model_fold_{fold}_epoch_{epoch}_effnetB0_val_auc_{auc_val:.4f}_val_loss_{avg_val_loss:.4f}.pth")
+                print(f"  -> Saved best model for fold {fold} with Val AUC: {auc_val:.4f}")
+
+    # 6. (Optional) Demonstration: Compute Kaggle AUC on a small sample.
+    sample_df = df.sample(config["sample_size"], random_state=config["random_state"]).reset_index(drop=True)
+    sample_ds = BirdCLEFDataset(sample_df, config["audio_dir"], mode="train")
+
+    # Load final model from last fold (for demonstration).
+    model = Model().to(training_config["device"])
+    model.load_state_dict(torch.load(f"model_fold_{training_config['num_folds']-1}.pth"))
     model.eval()
-    
-    pred_val = []
-    label_val = []
-    
-    running_val_loss = 0.0
-    
+
+    label_mapper = sample_ds.label_mapper
+    rev_mapper = sample_ds.reverse_label_mapper
+    all_labels, all_preds = [], []
     with torch.no_grad():
-        for x, y in tqdm(val_loader, desc="Validation"):
-            x = x.to(training_config["device"])
-            y = y.to(training_config["device"])
-
-            # Converting to one hot encoding  
-            y_one_hot = nn.functional(
-                y,
-                num_classes = config['num_classes']
-            ).float()      
-
+        for i in range(len(sample_ds)):
+            x, y = sample_ds[i]
+            x = x.unsqueeze(0).to(training_config["device"])
             outputs = model(x)
-            
-            loss = criterion(outputs, y)
+            probs = torch.softmax(outputs, dim=1).cpu().numpy()
+            pred_idx = np.argmax(probs, axis=1).item()
 
-            running_val_loss += loss.item() 
-            props = torch.softmax(outputs, dim=1)
-            pred_val.append(props.detach().cpu().numpy())
-            label_val.append()
-    
-    
-    # --- Computing AUC and Loss ---
-    auc_train = cal_score(label_train, pred_train)
-    auc_val = cal_score(label_val, pred_val)
-    
-    avg_train_loss = running_loss / len(train_loader)
-    avg_val_loss = running_loss / len(val_loader)
+            actual_label = rev_mapper[y]
+            predicted_label = rev_mapper.get(pred_idx, f"id_{pred_idx}")
+            print(f"Sample {i}: Predicted: {predicted_label} | Actual: {actual_label}")
 
-    print(f'[Fold]: {fold} | [EPOCH]: {epoch} | Loss: {avg_train_loss:4f} | Val_Loss: {avg_val_loss:4f}')    
-    print(f'[Fold]: {fold} |  [EPOCH]: {epoch} | Train AUC: {auc_train:4f} | Val AUC: {auc_val:4f}')    
-    
-    if best_auc <= auc_val and epoch < 5:
-        best_auc = auc_val
-        torch.save(model.state_dict(), f"fold_{fold}_epoch_{epoch}_effnetB0_val_auc_{auc_val}_val_loss_{avg_val_loss}.pth" )
-        
-        
+            one_hot_true = np.zeros((1, len(label_mapper)))
+            one_hot_true[0, y] = 1.0
+            one_hot_pred = np.zeros((1, len(label_mapper)))
+            one_hot_pred[0, pred_idx] = 1.0
 
-     
+            all_labels.append(one_hot_true)
+            all_preds.append(one_hot_pred)
 
-
-
-
-          
+    try:
+        auc_score = cal_score(np.concatenate(all_labels, axis=0), np.concatenate(all_preds, axis=0))
+        print(f"Overall Kaggle Macro AUC Score on sample: {auc_score:.4f}")
+    except Exception as e:
+        print(f"Error computing AUC on sample: {e}")
