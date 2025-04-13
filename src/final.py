@@ -41,7 +41,8 @@ config = {
 training_config = {
     "epochs": 10,             # Increased from 1 to 10 epochs for longer training
     "num_folds": 3,
-    "batch_size": 16,
+    "batch_size": 8,
+    "val_batch_size": 16,
     "target_col": "primary_label",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "lr": 1e-4,
@@ -76,16 +77,17 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
         average="macro",
     )
 
-def cal_score(labels: np.ndarray, preds: np.ndarray, label_mapper: dict) -> float:
-    """
-    Calculate Kaggle-style macro ROC-AUC from ground truth and predictions.
-    """
-    columns = list(label_mapper.keys())
-    labels_df = pd.DataFrame((labels > 0.5).astype(int), columns=columns)
-    preds_df = pd.DataFrame(preds, columns=columns)
-    labels_df["id"] = np.arange(len(labels_df))
-    preds_df["id"] = np.arange(len(preds_df))
-    return score(labels_df, preds_df, row_id_column_name="id")
+def cal_score(labels, preds):
+    labels = np.concatenate(labels)
+    preds = np.concatenate(preds)
+    
+    labels_df = pd.DataFrame(labels > 0.5, columns = list(label_mapper.keys()))
+    pred_df = pd.DataFrame(preds, columns=list(label_mapper.keys()))
+    
+    label_df['id'] = np.arange(len(labels_df))
+    pred_df['id'] = np.arange(len(pred_df))
+    
+    return score(label_df, pred_df, row_id_column_name='id')
 
 ########################################
 #         DATASET DEFINITION           #
@@ -204,115 +206,102 @@ if __name__ == "__main__":
 
         train_loader = DataLoader(
             train_ds, batch_size=training_config["batch_size"],
-            shuffle=True, num_workers=2, drop_last=False
+            shuffle=True, num_workers=2, drop_last=True
         )
         val_loader = DataLoader(
-            val_ds, batch_size=training_config["batch_size"],
+            val_ds, batch_size=training_config["val_batch_size"],
             shuffle=False, num_workers=2, drop_last=False
         )
 
-        model = Model().to(training_config["device"])
+        # Initializing model
+        model = Model(name=config['model_name']).to(training_config["device"])
         optimizer = torch.optim.Adam(model.parameters(), lr=training_config["lr"])
         criterion = nn.CrossEntropyLoss()
 
-        best_acc = 0.0
+        best_auc = 0
 
-        # 4. Epoch loop.
+        # Per fold training
         for epoch in range(training_config["epochs"]):
             print(f"\nEpoch {epoch} / {training_config['epochs']-1}")
             model.train()
+            
+            pred_train = []
+            label_train = []
+            
             running_loss = 0.0
 
             # --- TRAINING ---
-            for x_batch, y_batch in tqdm(train_loader, desc="Training", leave=False):
-                x_batch = x_batch.to(training_config["device"])
-                y_batch = y_batch.to(training_config["device"])
+            for x, y in tqdm(train_loader, desc="Training"):
+                x = x.to(training_config["device"])
+                y = y.to(training_config["device"])
+
+                # Converting to one hot encoding  
+                y_one_hot = nn.functional(
+                    y,
+                    num_classes = config['num_classes']
+                ).float()      
 
                 optimizer.zero_grad()
-                logits = model(x_batch)
-                loss = criterion(logits, y_batch)
-                loss.backward()
+                outputs = model(x)
+               
+                loss = criterion(outputs, y)
+                loss.backward() # backpropagation
                 optimizer.step()
 
-                running_loss += loss.item() * x_batch.size(0)
-            epoch_loss = running_loss / len(train_loader.dataset)
-            print(f"Fold {fold} | Epoch {epoch} | Train Loss: {epoch_loss:.4f}")
-
-            # --- VALIDATION ---
-            model.eval()
-            correct = 0
-            total = 0
-            all_true = []
-            all_probs = []
-            with torch.no_grad():
-                for x_batch, y_batch in tqdm(val_loader, desc="Validation", leave=False):
-                    x_batch = x_batch.to(training_config["device"])
-                    y_batch = y_batch.to(training_config["device"])
-                    logits = model(x_batch)
-                    prob = torch.softmax(logits, dim=1)  # [batch_size, num_classes]
-                    _, preds = torch.max(prob, 1)
-                    total += y_batch.size(0)
-                    correct += (preds == y_batch).sum().item()
-
-                    # One-hot encode ground truth for AUC calculation.
-                    batch_size = y_batch.size(0)
-                    one_hot_y = torch.zeros(batch_size, config["num_classes"]).to(training_config["device"])
-                    one_hot_y.scatter_(1, y_batch.unsqueeze(1), 1)
-                    all_true.append(one_hot_y.cpu().numpy())
-                    all_probs.append(prob.cpu().numpy())
-
-            val_acc = correct / total if total > 0 else 0
-            all_true = np.concatenate(all_true, axis=0)
-            all_probs = np.concatenate(all_probs, axis=0)
-            try:
-                macro_auc = cal_score(all_true, all_probs, val_ds.label_mapper)
-            except Exception as e:
-                macro_auc = f"Error: {e}"
-            print(f"Fold {fold} | Epoch {epoch} | Validation Acc: {val_acc:.4f} | Macro AUC: {macro_auc}")
-
-            # Checkpointing: Save best model for this fold.
-            if val_acc > best_acc:
-                best_acc = val_acc
-                torch.save(model.state_dict(), f"model_fold_{fold}.pth")
-                print(f"  -> Saved best model for fold {fold} with acc={val_acc:.4f}")
-
-    # 5. (Optional) Prediction and metric demonstration on a small sample.
-    sample_df = df.sample(config["sample_size"], random_state=config["random_state"]).reset_index(drop=True)
-    sample_ds = BirdCLEFDataset(sample_df, config["audio_dir"], mode="train")
-
-    # Load final model from the last fold (example).
-    model = Model().to(training_config["device"])
-    model.load_state_dict(torch.load(f"model_fold_{training_config['num_folds']-1}.pth"))
+                running_loss += loss.item() 
+                props = torch.softmax(outputs, dim=1)
+                pred_train.append(props.detach().cpu().numpy())
+                label_train.append()
+                
+            
+    # --- VALIDATION ---
     model.eval()
-
-    label_mapper = sample_ds.label_mapper
-    rev_mapper = sample_ds.reverse_label_mapper
-    all_labels, all_preds = [], []
+    
+    pred_val = []
+    label_val = []
+    
+    running_val_loss = 0.0
+    
     with torch.no_grad():
-        for i in range(len(sample_ds)):
-            x, y = sample_ds[i]
-            x = x.unsqueeze(0).to(training_config["device"])
-            logits = model(x)
-            prob = torch.softmax(logits, dim=1).cpu().numpy()
-            pred_idx = np.argmax(prob, axis=1).item()
+        for x, y in tqdm(val_loader, desc="Validation"):
+            x = x.to(training_config["device"])
+            y = y.to(training_config["device"])
 
-            actual_label = rev_mapper[y]
-            predicted_label = rev_mapper.get(pred_idx, f"id_{pred_idx}")
-            print(f"Sample {i}: Predicted: {predicted_label} | Actual: {actual_label}")
+            # Converting to one hot encoding  
+            y_one_hot = nn.functional(
+                y,
+                num_classes = config['num_classes']
+            ).float()      
 
-            one_hot_true = np.zeros((1, len(label_mapper)))
-            one_hot_true[0, y] = 1.0
-            one_hot_pred = np.zeros((1, len(label_mapper)))
-            one_hot_pred[0, pred_idx] = 1.0
-            all_labels.append(one_hot_true)
-            all_preds.append(one_hot_pred)
+            outputs = model(x)
+            
+            loss = criterion(outputs, y)
 
-    try:
-        auc_score = cal_score(
-            np.concatenate(all_labels, axis=0),
-            np.concatenate(all_preds, axis=0),
-            label_mapper
-        )
-        print(f"Overall Kaggle Macro AUC Score: {auc_score:.4f}")
-    except Exception as e:
-        print(f"Error computing AUC: {e}")
+            running_val_loss += loss.item() 
+            props = torch.softmax(outputs, dim=1)
+            pred_val.append(props.detach().cpu().numpy())
+            label_val.append()
+    
+    
+    # --- Computing AUC and Loss ---
+    auc_train = cal_score(label_train, pred_train)
+    auc_val = cal_score(label_val, pred_val)
+    
+    avg_train_loss = running_loss / len(train_loader)
+    avg_val_loss = running_loss / len(val_loader)
+
+    print(f'[Fold]: {fold} | [EPOCH]: {epoch} | Loss: {avg_train_loss:4f} | Val_Loss: {avg_val_loss:4f}')    
+    print(f'[Fold]: {fold} |  [EPOCH]: {epoch} | Train AUC: {auc_train:4f} | Val AUC: {auc_val:4f}')    
+    
+    if best_auc <= auc_val and epoch < 5:
+        best_auc = auc_val
+        torch.save(model.state_dict(), f"fold_{fold}_epoch_{epoch}_effnetB0_val_auc_{auc_val}_val_loss_{avg_val_loss}.pth" )
+        
+        
+
+     
+
+
+
+
+          
