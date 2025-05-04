@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
+import torch.nn.functional as F
 from warnings import filterwarnings
 filterwarnings("ignore")
 
@@ -463,6 +464,15 @@ if __name__ == "__main__":
             collate_fn=custom_collate_fn
         )
 
+        # Setup checkpoint directory
+        checkpoints_dir = Path("checkpoints")
+        checkpoints_dir.mkdir(exist_ok=True)
+        
+        # Check for existing checkpoints for this fold
+        checkpoint_files = list(checkpoints_dir.glob(f"checkpoint_fold_{fold}_epoch_*.pth"))
+        start_epoch = 0
+        best_auc = 0
+
         # 4. Create model, optimizer, criterion
         model = Model(num_classes=num_total_classes).to(training_config["device"])
         
@@ -509,12 +519,28 @@ if __name__ == "__main__":
             milestones=[warmup_steps]
         )
 
-        # Track best model
-        best_auc = 0
-        best_model_path = None
+        # Check for and load checkpoint if exists
+        if checkpoint_files:
+            # Find the latest checkpoint
+            latest_checkpoint = max(checkpoint_files, key=lambda x: int(str(x).split('_epoch_')[1].split('.')[0]))
+            print(f"Found checkpoint: {latest_checkpoint}. Resuming training...")
+            
+            # Load checkpoint
+            checkpoint = torch.load(latest_checkpoint)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_auc = checkpoint.get('best_auc', 0)
+            
+            # Check if base model was unfrozen in the checkpoint
+            if start_epoch > training_config["freeze_epochs"]:
+                model.unfreeze_base()
+            
+            print(f"Resuming from epoch {start_epoch} with best AUC: {best_auc:.4f}")
 
         # 5. Epoch loop
-        for epoch in range(training_config["epochs"]):
+        for epoch in range(start_epoch, training_config["epochs"]):
             print(f"\nEpoch {epoch+1}/{training_config['epochs']}")
             
             # Unfreeze base model after specified number of epochs
@@ -554,16 +580,36 @@ if __name__ == "__main__":
             # Update learning rate scheduler - for per-batch update
             # scheduler.step()
             
+            # Save periodic checkpoint (every epoch)
+            periodic_checkpoint_path = checkpoints_dir / f"checkpoint_fold_{fold}_epoch_{epoch+1}.pth"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_auc': auc_val,
+                'best_auc': best_auc,
+                'global_label_mapper': global_label_mapper,
+            }, periodic_checkpoint_path)
+            print(f" -> Saved periodic checkpoint at epoch {epoch+1}")
+            
             # Checkpointing: Save best model based on validation AUC
             if isinstance(auc_val, float) and auc_val > best_auc:
                 best_auc = auc_val
-                # Create directories if they don't exist
-                checkpoints_dir = Path("checkpoints")
-                checkpoints_dir.mkdir(exist_ok=True)
-                
-                # Save model
-                best_model_path = checkpoints_dir / f"model_fold_{fold}_epoch_{epoch+1}_auc_{auc_val:.4f}.pth"
-                torch.save(model.state_dict(), best_model_path)
+                best_model_path = checkpoints_dir / f"best_model_fold_{fold}_auc_{auc_val:.4f}.pth"
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'val_auc': auc_val,
+                    'best_auc': best_auc,
+                    'global_label_mapper': global_label_mapper,
+                }, best_model_path)
                 print(f" -> Saved best model with Val AUC: {auc_val:.4f}")
         
         print(f"\nTraining completed for fold {fold}. Best validation AUC: {best_auc:.4f}")
@@ -572,9 +618,14 @@ if __name__ == "__main__":
         print("\nEvaluating best model on validation set...")
         
         # Load best model
-        if best_model_path and Path(best_model_path).exists():
+        best_model_files = list(checkpoints_dir.glob(f"best_model_fold_{fold}_*.pth"))
+        if best_model_files:
+            best_model_path = max(best_model_files, key=lambda x: float(str(x).split('_auc_')[1].split('.')[0]))
+            print(f"Loading best model: {best_model_path}")
+            
+            checkpoint = torch.load(best_model_path)
             model = Model(num_classes=num_total_classes).to(training_config["device"])
-            model.load_state_dict(torch.load(best_model_path))
+            model.load_state_dict(checkpoint['model_state_dict'])
             model.eval()
             
             # Run full validation

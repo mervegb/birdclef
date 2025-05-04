@@ -14,3 +14,5 @@ pytorch_lightning
 opencv-python
 timm
 tensorboard
+colorednoise
+audiomentations

@@ -7,7 +7,15 @@ import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 import os
-import kaggle_metric_utilities
+import scipy.signal
+from sklearn.metrics import roc_auc_score
+import random
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+import pickle
+import warnings
+warnings.filterwarnings('ignore')
+
 
 
 # Model definition from training code
@@ -46,8 +54,7 @@ class Model(nn.Module):
         return x
 
 
-
-# Configuration (reusing parts from your training code)
+# Configuration
 config = {
     "sample_rate": 32000,
     "amplification_factor": 1024,
@@ -62,14 +69,23 @@ config = {
     "test_audio_dir": "/kaggle/input/birdclef-2025/test_soundscapes", 
     "submission_csv": "/kaggle/input/birdclef-2025/sample_submission.csv", 
     "model_paths": [
-        "/kaggle/input/effnet-b0-dataset/model_fold_0_epoch_20_auc_0.8782.pth", 
-        "/kaggle/input/effnet-b0-dataset/model_fold_1_epoch_20_auc_0.8805.pth",
-        "/kaggle/input/effnet-b0-dataset/model_fold_2_epoch_20_auc_0.8789.pth"
+        '/kaggle/input/effnet-b0-dataset/model_fold_0_epoch_20_auc_0.8782.pth',
+        '/kaggle/input/effnet-b0-dataset/model_fold_1_epoch_20_auc_0.8805.pth',
+        '/kaggle/input/effnet-b0-dataset/model_fold_2_epoch_20_auc_0.8789.pth'    
     ],
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "batch_size": 16,
-    "num_chunks_per_audio": 12,  # Number of chunks to extract per test audio
-    "overlap": 0.5,  # Overlap between chunks
+    "num_chunks_per_audio": 18,  # Increased from 12
+    "overlap": 0.75,  # Increased from 0.5
+    "tta_transforms": 5,  # Number of test-time augmentations
+    "temporal_window": 3,  # For temporal smoothing
+    "confidence_threshold": 0.1,  # Minimum confidence for predictions
+    "post_processing": True,  # Enable post-processing
+    "calibration_file": "calibration_model.pkl",  # Path to save/load calibration model
+    "smoothing": True,  # Enable temporal smoothing
+    "submission_path": "submission.csv",  # Path to save submission file
+    "smooth_weights": [0.2, 0.6, 0.2],  # Weights for smoothing [prev, current, next]
+    "edge_weights": [0.8, 0.2],  # Weights for edge cases [current, neighbor]
 }
 
 
@@ -117,6 +133,51 @@ def process_audio(audio_path, sr=config["sample_rate"], num_chunks=config["num_c
         chunks.append(mel_sp)
     
     return chunks
+
+
+def smooth_submission(submission_path):
+    """
+    Post-process the submission CSV by smoothing predictions to enforce temporal consistency.
+    For each soundscape (grouped by the file name part of 'row_id'), each row's predictions
+    are averaged with those of its neighbors using defined weights.
+    
+    :param submission_path: Path to the submission CSV file.
+    """
+    print("Smoothing submission predictions...")
+    sub = pd.read_csv(submission_path)
+    cols = sub.columns[1:]  # Exclude row_id column
+    
+    # Extract group names by splitting row_id on the last underscore
+    groups = sub['row_id'].str.rsplit('_', n=1).str[0].values
+    unique_groups = np.unique(groups)
+    
+    for group in unique_groups:
+        # Get indices for the current group
+        idx = np.where(groups == group)[0]
+        sub_group = sub.iloc[idx].copy()
+        predictions = sub_group[cols].values
+        new_predictions = predictions.copy()
+        
+        if predictions.shape[0] > 1:
+            # Smooth the predictions using neighboring segments
+            # First segment: weighted average with the next segment
+            new_predictions[0] = (predictions[0] * config["edge_weights"][0]) + (predictions[1] * config["edge_weights"][1])
+            
+            # Last segment: weighted average with the previous segment
+            new_predictions[-1] = (predictions[-1] * config["edge_weights"][0]) + (predictions[-2] * config["edge_weights"][1])
+            
+            # Middle segments: weighted average with previous and next segments
+            for i in range(1, predictions.shape[0]-1):
+                new_predictions[i] = (predictions[i-1] * config["smooth_weights"][0]) + \
+                                    (predictions[i] * config["smooth_weights"][1]) + \
+                                    (predictions[i+1] * config["smooth_weights"][2])
+        
+        # Replace the smoothed values in the submission dataframe
+        sub.iloc[idx, 1:] = new_predictions
+    
+    sub.to_csv(submission_path, index=False)
+    print(f"Smoothed submission saved to {submission_path}")
+    return sub
 
 
 def run_inference():
@@ -248,9 +309,13 @@ def run_inference():
     submission = submission[submission_df.columns]
     
     # Save submission file
-    submission.to_csv('submission.csv', index=False)
-    print(f"Submission saved to 'submission.csv' with shape {submission.shape}")
+    submission.to_csv(config["submission_path"], index=False)
+    print(f"Submission saved to '{config['submission_path']}' with shape {submission.shape}")
     
+    # Apply temporal smoothing if enabled
+    if config["smoothing"]:
+        smoothed_submission = smooth_submission(config["submission_path"])
     
+
 if __name__ == "__main__":
-        run_inference()
+    run_inference()
