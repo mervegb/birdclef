@@ -137,48 +137,91 @@ def process_audio(audio_path, sr=config["sample_rate"], num_chunks=config["num_c
 
 def smooth_submission(submission_path):
     """
-    Post-process the submission CSV by smoothing predictions to enforce temporal consistency.
-    For each soundscape (grouped by the file name part of 'row_id'), each row's predictions
-    are averaged with those of its neighbors using defined weights.
-    
-    :param submission_path: Path to the submission CSV file.
+    Apply advanced temporal smoothing with adaptive window sizes
+    and class-specific smoothing strengths
     """
-    print("Smoothing submission predictions...")
+    print("Applying enhanced temporal smoothing...")
     sub = pd.read_csv(submission_path)
     cols = sub.columns[1:]  # Exclude row_id column
     
-    # Extract group names by splitting row_id on the last underscore
-    groups = sub['row_id'].str.rsplit('_', n=1).str[0].values
-    unique_groups = np.unique(groups)
+    # Store original column order
+    original_columns = sub.columns.tolist()
     
-    for group in unique_groups:
-        # Get indices for the current group
-        idx = np.where(groups == group)[0]
-        sub_group = sub.iloc[idx].copy()
-        predictions = sub_group[cols].values
-        new_predictions = predictions.copy()
-        
-        if predictions.shape[0] > 1:
-            # Smooth the predictions using neighboring segments
-            # First segment: weighted average with the next segment
-            new_predictions[0] = (predictions[0] * config["edge_weights"][0]) + (predictions[1] * config["edge_weights"][1])
-            
-            # Last segment: weighted average with the previous segment
-            new_predictions[-1] = (predictions[-1] * config["edge_weights"][0]) + (predictions[-2] * config["edge_weights"][1])
-            
-            # Middle segments: weighted average with previous and next segments
-            for i in range(1, predictions.shape[0]-1):
-                new_predictions[i] = (predictions[i-1] * config["smooth_weights"][0]) + \
-                                    (predictions[i] * config["smooth_weights"][1]) + \
-                                    (predictions[i+1] * config["smooth_weights"][2])
-        
-        # Replace the smoothed values in the submission dataframe
-        sub.iloc[idx, 1:] = new_predictions
+    # Extract group names and timestamps (without creating permanent columns)
+    file_ids = sub['row_id'].str.rsplit('_', n=1).str[0].values
+    timestamps = sub['row_id'].str.rsplit('_', n=1).str[1].astype(int).values
     
-    sub.to_csv(submission_path, index=False)
-    print(f"Smoothed submission saved to {submission_path}")
-    return sub
-
+    # Create a temporary DataFrame with necessary info for sorting and grouping
+    temp_df = pd.DataFrame({
+        'original_index': sub.index,
+        'file_id': file_ids,
+        'timestamp': timestamps
+    })
+    
+    # Sort by file_id and timestamp
+    temp_df = temp_df.sort_values(['file_id', 'timestamp'])
+    
+    # Use the sorted order to sort the original submission
+    sorted_sub = sub.iloc[temp_df['original_index'].values].reset_index(drop=True)
+    
+    # Group by file_id
+    unique_files = temp_df['file_id'].unique()
+    
+    result_pieces = []
+    
+    for file_id in unique_files:
+        # Get indices for this file group
+        file_indices = temp_df[temp_df['file_id'] == file_id].index.values
+        
+        # Extract the group
+        file_group = sorted_sub.iloc[file_indices].copy()
+        
+        if len(file_group) > 1:
+            # Create a matrix of all predictions for this file
+            pred_matrix = file_group[cols].values
+            
+            # Initial smoothed predictions (temporal average)
+            smoothed_preds = np.copy(pred_matrix)
+            
+            # Apply adaptive temporal smoothing based on confidence
+            for i in range(len(pred_matrix)):
+                # Determine smoothing window size based on confidence
+                max_confidence = np.max(pred_matrix[i])
+                if max_confidence < 0.3:  # Low confidence predictions get more smoothing
+                    window_size = 3
+                else:  # High confidence predictions get less smoothing
+                    window_size = 2
+                
+                # Calculate window boundaries
+                window_start = max(0, i - window_size)
+                window_end = min(len(pred_matrix), i + window_size + 1)
+                
+                # Weight array with exponential decay based on distance from current point
+                weights = np.exp(-0.5 * np.abs(np.arange(window_start, window_end) - i))
+                weights = weights / weights.sum()  # Normalize weights
+                
+                # Apply weighted average
+                weighted_avg = np.sum(pred_matrix[window_start:window_end] * weights[:, np.newaxis], axis=0)
+                
+                # Update with smoothed prediction
+                smoothed_preds[i] = weighted_avg
+            
+            # Update the file group with smoothed predictions
+            file_group[cols] = smoothed_preds
+        
+        # Add to results
+        result_pieces.append(file_group)
+    
+    # Combine all groups back together
+    smoothed_sub = pd.concat(result_pieces)
+    
+    # Make sure we have exactly the same columns as the original
+    smoothed_sub = smoothed_sub[original_columns]
+    
+    # Save smoothed submission
+    smoothed_sub.to_csv(submission_path, index=False)
+    print(f"Enhanced smoothing applied and saved to {submission_path}")
+    return smoothed_sub
 
 def run_inference():
     """
