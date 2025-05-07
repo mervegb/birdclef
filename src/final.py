@@ -51,6 +51,26 @@ training_config = {
     "freeze_epochs": 3,
 }
 
+
+### Mixup Data Augmentation
+def mixup_data(x, y, alpha=0.2):
+    """Applies mixup augmentation to a batch of data."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Criterion for mixup augmentation."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
 ########################################
 # KAGGLE METRIC UTILITIES #
 ########################################
@@ -299,10 +319,14 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch):
         x_batch = x_batch.to(device)
         y_batch = y_batch.to(device)
         
+         # Apply mixup
+        x_batch, y_a, y_b, lam = mixup_data(x_batch, y_batch)
+        
         # Forward pass
         optimizer.zero_grad()
         outputs = model(x_batch)
-        loss = criterion(outputs, y_batch)
+        #loss = criterion(outputs, y_batch)
+        loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
         
         # Backward pass
         loss.backward()
